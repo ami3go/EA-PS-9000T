@@ -6,7 +6,7 @@ import EAPS9000T.EAPS9000T_class as ps
 cmd = ps.storage()
 # print(cmd.configure.current.dc.str())
 # print(cmd.measure.current.dc.req())
-ps_dev = ps.com_interface()
+ps_dev = ps.EaPs9000T()
 ps_dev.init("COM8")
 ps_dev.send(cmd.system.lock.on())
 # print(dev.query("*IDN?"))
