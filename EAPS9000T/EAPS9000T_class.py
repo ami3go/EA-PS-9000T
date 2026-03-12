@@ -5,6 +5,21 @@ import serial
 import serial.tools.list_ports
 
 
+def get_com_port_by_keyword(keyword):
+    """
+    Returns the COM port number (e.g., 'COM3') for a device
+    whose description contains the given keyword.
+    Returns None if no matching device is found.
+    """
+    ports = serial.tools.list_ports.comports()
+    for port in ports:
+        # print(port)
+        # print(port.description.lower())
+        # Check if the keyword is present in the port's description
+        if keyword.lower() in port.description.lower(): # Using .lower() for case-insensitive search
+            return port.device
+    return None
+
 def range_check(val, min, max, val_name):
     if val > max:
         print(f"Wrong {val_name}: {val}. Max value should be less then {max}")
@@ -15,7 +30,7 @@ def range_check(val, min, max, val_name):
     return val
 
 
-class com_interface:
+class EaPs9000T:
     def __init__(self):
         # Commands Subsystem
         # this is the list of Subsystem commands
@@ -24,6 +39,28 @@ class com_interface:
         self.cmd = storage()
         self.ser = None
         self._retry_cnt = 10
+        com_port_list = [comport.device for comport in serial.tools.list_ports.comports()]
+        com_port = get_com_port_by_keyword("PS 9000 T")
+        if com_port not in com_port_list:
+            print("COM port is not found")
+            print("Please ensure that USB is connected")
+            print(f"Please check COM port Number. Currently it is {com_port} ")
+            print(f'Founded COM ports:{com_port_list}')
+        else:
+            self.ser = serial.Serial(
+                port=com_port,
+                baudrate=115200,
+                timeout=0.1
+            )
+            if not self.ser.isOpen:
+                self.ser.open()
+            txt = '*IDN?'
+
+            read_back = self.query(txt)
+            print(f"Connected to: {read_back}")
+            print("Turn remote mode On")
+            self.remote_on()
+
     @property
     def retry_cnt(self):
         return self._retry_cnt
@@ -33,27 +70,6 @@ class com_interface:
         value = int(value)
         self._retry_cnt = value
 
-    def init(self, com_port, baudrate_var=115200):
-        com_port_list = [comport.device for comport in serial.tools.list_ports.comports()]
-        if com_port not in com_port_list:
-            print("COM port is not found")
-            print("Please ensure that USB is connected")
-            print(f"Please check COM port Number. Currently it is {com_port} ")
-            print(f'Founded COM ports:{com_port_list}')
-            return False
-        else:
-            self.ser = serial.Serial(
-                port=com_port,
-                baudrate=baudrate_var,
-                timeout=0.1
-            )
-            if not self.ser.isOpen:
-                self.ser.open()
-            txt = '*IDN?'
-
-            read_back = self.query(txt)
-            print(f"Connected to: {read_back}")
-            return True
 
     def send(self, txt):
         # will put sending command here
@@ -80,6 +96,7 @@ class com_interface:
                 time.sleep(2)
 
     def close(self):
+        self.remote_off()
         self.ser.close()
         self.ser = None
         self.cmd = None
@@ -373,6 +390,14 @@ class measure:
 
 
 if __name__ == '__main__':
+   ps = EaPs9000T()
+   ps.remote_on()
+   ps.set_voltage(10)
+   ps.output_on()
+
+   time.sleep(3)
+   ps.output_off()
+   ps.close()
    #  cmd = storage()
    #  # print(cmd.configure.current.dc.str())
    #  # print(cmd.measure.current.dc.req())
