@@ -1,6 +1,5 @@
 import time
 
-import pyvisa # PyVisa info @ http://PyVisa.readthedocs.io/en/stable/
 import serial
 import serial.tools.list_ports
 
@@ -438,4 +437,3 @@ if __name__ == '__main__':
    print(cmd.source.voltage.val(10))
    print(cmd.source.current.ovc.val(5))
    print(cmd.source.voltage.ovp.val(500))
-

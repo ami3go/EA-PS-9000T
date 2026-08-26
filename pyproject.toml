@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ea-ps-9000t"
+version = "0.1.0"
+description = "Serial SCPI control helpers for EA Elektro-Automatik PS 9000 T power supplies."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [{ name = "Aleksandr Chasnyk" }]
+keywords = ["EA", "Elektro-Automatik", "PS 9000 T", "SCPI", "power-supply", "serial"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = ["pyserial>=3.5"]
+
+[project.optional-dependencies]
+dev = ["build>=1.2", "pytest>=7"]
+
+[project.urls]
+Homepage = "https://github.com/ami3go/EA-PS-9000T"
+Repository = "https://github.com/ami3go/EA-PS-9000T"
+Issues = "https://github.com/ami3go/EA-PS-9000T/issues"
+
+[tool.setuptools]
+packages = ["EAPS9000T"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-ra"]
