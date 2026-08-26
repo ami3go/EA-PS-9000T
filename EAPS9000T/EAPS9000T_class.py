@@ -347,7 +347,7 @@ class EaPs9000T:
         port: Optional[str] = None,
         baudrate: int = 115200,
         timeout: float = 1.0,
-        write_timeout: float = 1.0,
+        write_timeout: Optional[float] = None,
         keyword: str = "PS 9000 T",
         retry_cnt: int = 3,
         retry_delay: float = 0.2,
@@ -393,7 +393,10 @@ class EaPs9000T:
         self.port = port
         self.baudrate = int(baudrate)
         self.timeout = float(timeout)
-        self.write_timeout = float(write_timeout)
+        # Keep pySerial's blocking-write default for compatibility with the
+        # original driver and Windows USB/virtual-COM adapters.  Supplying a
+        # finite timeout opts into pySerial's overlapped-write timeout path.
+        self.write_timeout = None if write_timeout is None else float(write_timeout)
         self.keyword = keyword
         self.retry_delay = float(retry_delay)
         self.limits = limits or PowerSupplyLimits()
