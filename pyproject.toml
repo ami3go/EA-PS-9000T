@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ea-ps-9000t"
+name = "eaps9000t"
 version = "0.1.0"
 description = "Serial SCPI control helpers for EA Elektro-Automatik PS 9000 T power supplies."
 readme = "README.md"
