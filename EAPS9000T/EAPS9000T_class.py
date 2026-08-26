@@ -825,8 +825,43 @@ class EaPs9000T:
                 )
             self.output_state_unknown = False
 
-    def output_off(self, verify: bool = False) -> None:
-        self.send(self.cmd.output.off(), check_after=self.production_mode)
+    def output_off(self, verify: bool = False, *, recover_transport: bool = True) -> None:
+        """
+        Switch the output off and, if the serial handle has failed, recover it once.
+
+        A Windows USB/virtual-COM adapter can retain an apparently open handle
+        after a USB reset while rejecting every ``WriteFile`` request. Repeating
+        a write on that handle cannot recover it. For this idempotent safety
+        command, reopen the selected port once and resend ``OUTP OFF``. If that
+        recovery fails, ``output_state_unknown`` remains true and a
+        ``CommunicationError`` is raised.
+
+        Set ``recover_transport=False`` only when the caller owns connection
+        recovery explicitly.
+        """
+        try:
+            self.send(self.cmd.output.off(), check_after=self.production_mode)
+        except CommunicationError as initial_error:
+            self.output_state_unknown = True
+            if not recover_transport:
+                raise
+
+            self.logger.warning(
+                "[%s] OUTP OFF could not be written; reopening serial transport once",
+                self.station_id,
+                exc_info=True,
+            )
+            try:
+                # Do not attempt OUTPUT OFF during reconnect_safely()'s close
+                # phase: it is the failed handle we are recovering from.
+                self.reconnect_safely(force_output_off=False)
+                self.send(self.cmd.output.off(), check_after=self.production_mode)
+            except BaseException as recovery_error:
+                self.output_state_unknown = True
+                raise CommunicationError(
+                    "Failed to send 'OUTP OFF' after serial transport recovery"
+                ) from recovery_error
+
         self.output_state_unknown = True
         if verify or self.production_mode:
             # Wait for relay actuation before reading back state.
@@ -1101,6 +1136,7 @@ class EaPs9000T:
         escalate according to plant safety rules.
         """
         with self._io_lock:
+            previous_idn = self.idn
             try:
                 if self.is_connected:
                     self.close(
@@ -1117,7 +1153,23 @@ class EaPs9000T:
 
             self._closed = False
             self.ser = None
-            return self.connect(auto_remote=True, verify_remote=self.production_mode)
+            reconnected_idn = self.connect(auto_remote=True, verify_remote=self.production_mode)
+            if previous_idn and reconnected_idn != previous_idn:
+                # Do not continue operating if a port enumeration change or
+                # cable swap connected us to a different instrument.
+                replacement_ser = self.ser
+                self.ser = None
+                self._closed = True
+                if replacement_ser is not None:
+                    try:
+                        replacement_ser.close()
+                    except (SerialException, OSError):
+                        pass
+                raise DeviceIdentityError(
+                    "Serial reconnection returned a different instrument identity: "
+                    f"expected {previous_idn!r}, got {reconnected_idn!r}"
+                )
+            return reconnected_idn
 
 
 # ---------------------------------------------------------------------------
