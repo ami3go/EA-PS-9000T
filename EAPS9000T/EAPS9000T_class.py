@@ -1126,22 +1126,43 @@ class EaPs9000T:
             if verify:
                 self.check_device_health(expected_output=True, require_remote=True)
 
-    def reconnect_safely(self, *, force_output_off: bool = True, verify_output_off: bool = False) -> str:
+    def reconnect_safely(
+        self,
+        *,
+        force_output_off: bool = True,
+        verify_output_off: bool = False,
+        reconnect_attempts: int = 3,
+        reconnect_delay: float = 0.75,
+    ) -> str:
         """
         Best-effort reconnect helper for supervisors after link loss or USB reset.
 
         If communication is still possible and force_output_off=True, the driver
-        tries to de-energize the output before closing/reopening. If output state
-        cannot be verified, output_state_unknown is set and the caller should
-        escalate according to plant safety rules.
+        tries to de-energize the output before closing/reopening. After a failed
+        Windows WriteFile call, callers should pass force_output_off=False: no
+        further command is sent on the failed handle before it is closed.
+
+        USB serial interfaces can take a short time to re-enumerate after a
+        reset. The reconnect phase therefore retries opening and identifying the
+        configured instrument. If output state cannot be verified, the caller
+        must escalate according to plant safety rules.
         """
+        reconnect_attempts = int(reconnect_attempts)
+        if reconnect_attempts < 1:
+            raise ValueError("reconnect_attempts must be >= 1")
+        if reconnect_delay < 0:
+            raise ValueError("reconnect_delay must be >= 0")
+
         with self._io_lock:
             previous_idn = self.idn
             try:
                 if self.is_connected:
                     self.close(
                         output_off=force_output_off,
-                        remote_off=True,
+                        # A serial write failure means this handle cannot be
+                        # used to release remote mode either. Close it directly
+                        # so the recovery path can reopen a fresh handle.
+                        remote_off=force_output_off,
                         suppress_errors=not self.production_mode,
                         verify_output_off=verify_output_off,
                     )
@@ -1151,25 +1172,48 @@ class EaPs9000T:
             except EAPSError:
                 self.logger.warning("[%s] Error during reconnect close phase", self.station_id, exc_info=True)
 
-            self._closed = False
-            self.ser = None
-            reconnected_idn = self.connect(auto_remote=True, verify_remote=self.production_mode)
-            if previous_idn and reconnected_idn != previous_idn:
-                # Do not continue operating if a port enumeration change or
-                # cable swap connected us to a different instrument.
-                replacement_ser = self.ser
+            last_exc: Optional[BaseException] = None
+            for attempt in range(1, reconnect_attempts + 1):
+                if attempt > 1:
+                    time.sleep(reconnect_delay)
+                self._closed = False
                 self.ser = None
-                self._closed = True
-                if replacement_ser is not None:
-                    try:
-                        replacement_ser.close()
-                    except (SerialException, OSError):
-                        pass
-                raise DeviceIdentityError(
-                    "Serial reconnection returned a different instrument identity: "
-                    f"expected {previous_idn!r}, got {reconnected_idn!r}"
-                )
-            return reconnected_idn
+                try:
+                    reconnected_idn = self.connect(
+                        auto_remote=True,
+                        verify_remote=self.production_mode,
+                    )
+                    if previous_idn and reconnected_idn != previous_idn:
+                        # Do not continue operating if a port enumeration change
+                        # or cable swap connected us to a different instrument.
+                        replacement_ser = self.ser
+                        self.ser = None
+                        self._closed = True
+                        if replacement_ser is not None:
+                            try:
+                                replacement_ser.close()
+                            except (SerialException, OSError):
+                                pass
+                        raise DeviceIdentityError(
+                            "Serial reconnection returned a different instrument identity: "
+                            f"expected {previous_idn!r}, got {reconnected_idn!r}"
+                        )
+                    return reconnected_idn
+                except DeviceIdentityError:
+                    raise
+                except (CommunicationError, SerialException, OSError) as exc:
+                    last_exc = exc
+                    self.logger.warning(
+                        "[%s] Serial reconnect attempt %d/%d failed",
+                        self.station_id,
+                        attempt,
+                        reconnect_attempts,
+                        exc_info=True,
+                    )
+
+            raise CommunicationError(
+                f"Could not reconnect serial transport after {reconnect_attempts} attempt(s)"
+            ) from last_exc
 
 
 # ---------------------------------------------------------------------------

@@ -40,3 +40,24 @@ def test_output_off_recovers_a_failed_serial_transport_once() -> None:
 
     assert calls == ["OUTP OFF", "reconnect", "OUTP OFF"]
     assert supply.output_state_unknown is True
+
+
+def test_reconnect_retries_after_a_transient_open_failure() -> None:
+    supply = driver.EaPs9000T(auto_connect=False, limits=driver.PowerSupplyLimits())
+    supply.idn = "EA,PS 9000 T,1234"
+    attempts: list[int] = []
+
+    def connect(**_kwargs: object) -> str:
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise driver.CommunicationError("USB device is re-enumerating")
+        return "EA,PS 9000 T,1234"
+
+    supply.connect = connect  # type: ignore[method-assign]
+
+    assert supply.reconnect_safely(
+        force_output_off=False,
+        reconnect_attempts=2,
+        reconnect_delay=0,
+    ) == "EA,PS 9000 T,1234"
+    assert len(attempts) == 2
