@@ -1,0 +1,6 @@
+time_s,voltage_v,current_a,power_w,ovp_v,ocp_a,opp_w,output,ramp,comment
+0,0,1.0,100,30,2.0,150,off,step,Start with output off
+1,5,1.0,100,30,2.0,150,on,step,Enable output at 5 V
+5,12,1.5,200,30,2.0,250,keep,linear,Ramp from 12 V to next point
+10,24,2.0,300,30,2.5,350,keep,step,Hold 24 V
+15,0,1.0,100,30,2.0,150,off,step,End safely

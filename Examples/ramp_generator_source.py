@@ -1,7 +1,7 @@
 
 import time
 
-import EAPS9000T.EAPS9000T_class as ps
+import archive.EAPS9000T_class as ps
 
 cmd = ps.storage()
 # print(cmd.configure.current.dc.str())

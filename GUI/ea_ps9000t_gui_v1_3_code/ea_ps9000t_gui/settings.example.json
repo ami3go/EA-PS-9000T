@@ -1,0 +1,33 @@
+{
+  "theme": "dark_material",
+  "mock_mode": true,
+  "serial": {
+    "port": "COM8",
+    "baudrate": 115200,
+    "timeout": 1.0,
+    "write_timeout": 1.0,
+    "retry_cnt": 3,
+    "retry_delay": 0.2,
+    "keyword": "PS 9000 T"
+  },
+  "limits": {
+    "preset_name": "EA PS 9080-40 T",
+    "voltage_max": 80.0,
+    "current_max": 40.0,
+    "power_max": 1500.0,
+    "ovp_max": 88.0,
+    "ocp_max": 44.0,
+    "opp_max": 1650.0
+  },
+  "safety": {
+    "confirm_output_on": true,
+    "output_off_on_close": true,
+    "output_off_on_profile_error": true,
+    "disable_manual_controls_during_profile": true
+  },
+  "profile": {
+    "ramp_update_interval_ms": 100,
+    "measurement_log_interval_ms": 500,
+    "output_command_timing": "after_setpoints"
+  }
+}

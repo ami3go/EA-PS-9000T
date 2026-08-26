@@ -66,11 +66,10 @@ from __future__ import annotations
 import logging
 import math
 import re
-import threading
 import time
 import warnings
 from dataclasses import dataclass
-from typing import Optional, Sequence, Union
+from typing import Optional, Union
 
 try:
     import serial
@@ -129,22 +128,6 @@ class RangeError(ValueError, EAPSError):
 
 class DriverClosedError(CommunicationError):
     """Raised when a method is called after close() has been called."""
-
-
-class ConfigurationError(EAPSError):
-    """Raised when driver configuration is unsafe or incomplete."""
-
-
-class DeviceIdentityError(EAPSError):
-    """Raised when the connected instrument does not match expected identity."""
-
-
-class SafetyStateError(EAPSError):
-    """Raised when the driver cannot bring the instrument into a safe state."""
-
-
-class InstrumentAlarmError(EAPSError):
-    """Raised when instrument status/health checks indicate an alarm condition."""
 
 
 # ---------------------------------------------------------------------------
@@ -291,20 +274,6 @@ def parse_csv_numeric_response(response: str) -> tuple[float, ...]:
     return tuple(parse_numeric_response(item) for item in response.split(",") if item.strip())
 
 
-def _contains_case_insensitive(haystack: str, needle: str) -> bool:
-    """Return True when *needle* appears in *haystack*, ignoring case."""
-    return needle.casefold() in haystack.casefold()
-
-
-def _expected_parts(value: Optional[Union[str, Sequence[str]]]) -> tuple[str, ...]:
-    """Normalize optional identity expectation(s) into a tuple of strings."""
-    if value is None:
-        return ()
-    if isinstance(value, str):
-        return (value,) if value else ()
-    return tuple(part for part in value if part)
-
-
 # ---------------------------------------------------------------------------
 # Main driver
 # ---------------------------------------------------------------------------
@@ -358,26 +327,9 @@ class EaPs9000T:
         safe_close: bool = True,
         output_off_on_close: bool = True,
         logger: Optional[logging.Logger] = None,
-        *,
-        production_mode: bool = False,
-        allow_default_limits: bool = True,
-        expected_idn_contains: Optional[Union[str, Sequence[str]]] = None,
-        expected_model: Optional[str] = None,
-        expected_serial: Optional[str] = None,
-        station_id: Optional[str] = None,
-        raise_on_close_error: bool = False,
-        verify_output_off_on_close: bool = True,
-        measurement_array_supported: bool = False,
     ):
-        # In production mode explicit limits are required unless the caller
-        # intentionally opts into the original prototype defaults. This keeps
-        # old scripts compatible while allowing plant software to fail fast.
-        if limits is None and production_mode and not allow_default_limits:
-            raise ConfigurationError(
-                "EaPs9000T production_mode requires explicit PowerSupplyLimits. "
-                "Pass limits=PowerSupplyLimits(...) for the exact PSU model, or "
-                "set allow_default_limits=True only for bench/development use."
-            )
+        # FIX-12: Warn when default limits are used so plant misconfiguration is
+        # caught early rather than silently operating at wrong protection levels.
         if limits is None:
             warnings.warn(
                 "EaPs9000T: no PowerSupplyLimits provided; using defaults "
@@ -388,7 +340,6 @@ class EaPs9000T:
             )
 
         self._cmd = storage(limits=limits)   # FIX-1: private; never set to None
-        self._io_lock = threading.RLock()    # plant-safe serialization of all serial I/O
         self.ser: Optional[serial.Serial] = None
         self.port = port
         self.baudrate = int(baudrate)
@@ -399,16 +350,6 @@ class EaPs9000T:
         self.limits = limits or PowerSupplyLimits()
         self.safe_close = bool(safe_close)
         self.output_off_on_close = bool(output_off_on_close)
-        self.production_mode = bool(production_mode)
-        self.allow_default_limits = bool(allow_default_limits)
-        self.expected_idn_contains = _expected_parts(expected_idn_contains)
-        self.expected_model = expected_model
-        self.expected_serial = expected_serial
-        self.station_id = station_id or self.__class__.__name__
-        self.raise_on_close_error = bool(raise_on_close_error)
-        self.verify_output_off_on_close = bool(verify_output_off_on_close)
-        self.measurement_array_supported = bool(measurement_array_supported)
-        self.output_state_unknown = False
         self.logger = logger or logging.getLogger(self.__class__.__name__)
         # FIX-3: removed redundant `self._retry_cnt = 3`; property setter is the
         # single assignment path, which validates the value immediately.
@@ -461,17 +402,14 @@ class EaPs9000T:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        # Log close errors at ERROR level. In strict plant mode, re-raise close
-        # errors only when there is no original exception from the with-body so
-        # we do not mask the real test failure.
+        # FIX-11: Log close errors at ERROR level before the default suppression
+        # so they appear in plant logs even when suppress_errors=True.
         try:
-            self.close(suppress_errors=not self.raise_on_close_error)
+            self.close(suppress_errors=False)
         except Exception as close_exc:
             self.logger.error(
                 "Error(s) during driver close in __exit__: %s", close_exc, exc_info=True
             )
-            if (self.raise_on_close_error or self.production_mode) and exc_type is None:
-                raise
 
     # ------------------------------------------------------------------
     # Internal guards
@@ -504,81 +442,52 @@ class EaPs9000T:
         verify_remote: bool = False,
     ) -> str:
         """
-        Open the serial port, query *IDN?, validate identity, and optionally enter remote mode.
+        Open the serial port, query *IDN?, and optionally enter remote mode.
 
-        Returns the identification string. Safe to call on an already-connected
-        instance (returns existing IDN). The whole sequence is protected by the
-        I/O lock so watchdog pings or worker threads cannot interleave traffic.
+        Returns the identification string.
+        Safe to call on an already-connected instance (returns existing IDN).
         """
-        with self._io_lock:
-            if self._closed:
-                self._closed = False
+        # FIX-1: If the driver was previously closed, reset the flag so it can
+        # be re-opened without constructing a new object.
+        if self._closed:
+            self._closed = False
 
-            if self.is_connected:
-                return self.idn or ""
+        if self.is_connected:
+            return self.idn or ""
 
-            selected_port = port or self.port or get_com_port_by_keyword(self.keyword)
-            if selected_port is None:
-                ports = list_serial_ports()
-                raise InstrumentNotFoundError(
-                    f"No EA PS 9000 T serial port found with keyword {self.keyword!r}. "
-                    f"Visible ports: {ports}"
-                )
+        selected_port = port or self.port or get_com_port_by_keyword(self.keyword)
+        if selected_port is None:
+            ports = list_serial_ports()
+            raise InstrumentNotFoundError(
+                f"No EA PS 9000 T serial port found with keyword {self.keyword!r}. "
+                f"Visible ports: {ports}"
+            )
 
-            self.port = selected_port
-            _require_pyserial()
-            try:
-                self.ser = serial.Serial(
-                    port=selected_port,
-                    baudrate=self.baudrate,
-                    timeout=self.timeout,
-                    write_timeout=self.write_timeout,
-                )
-            except SerialException as exc:
-                raise CommunicationError(f"Could not open serial port {selected_port!r}") from exc
+        self.port = selected_port
+        _require_pyserial()
+        try:
+            self.ser = serial.Serial(
+                port=selected_port,
+                baudrate=self.baudrate,
+                timeout=self.timeout,
+                write_timeout=self.write_timeout,
+            )
+        except SerialException as exc:
+            raise CommunicationError(f"Could not open serial port {selected_port!r}") from exc
 
-            try:
-                self.ser.reset_input_buffer()
-            except (SerialException, OSError):
-                pass
+        # FIX-7: Flush stale bytes that may be present from a previous session
+        # (e.g. crash recovery, cable re-plug, USB reset).
+        try:
+            self.ser.reset_input_buffer()
+        except (SerialException, OSError):
+            pass  # Best-effort; don't block a fresh open on this.
 
-            try:
-                self.idn = self.query("*IDN?")
-                self._validate_identity(self.idn)
-                self.logger.info(
-                    "[%s] Connected to EA power supply on %s: %s",
-                    self.station_id,
-                    self.port,
-                    self.idn,
-                )
+        self.idn = self.query("*IDN?")
+        self.logger.info("Connected to EA power supply: %s", self.idn)
 
-                if auto_remote:
-                    self.remote_on(verify=verify_remote or self.production_mode)
-                return self.idn
-            except BaseException:
-                # Avoid leaving an open handle after a failed identity/remote check.
-                try:
-                    if self.ser is not None and self.ser.is_open:
-                        self.ser.close()
-                finally:
-                    self.ser = None
-                    self._closed = True
-                raise
-
-    def _validate_identity(self, idn: str) -> None:
-        """Verify the connected instrument is the expected plant device."""
-        expected_parts = list(self.expected_idn_contains)
-        if self.expected_model:
-            expected_parts.append(self.expected_model)
-        if self.expected_serial:
-            expected_parts.append(self.expected_serial)
-
-        for part in expected_parts:
-            if not _contains_case_insensitive(idn, part):
-                raise DeviceIdentityError(
-                    f"Connected instrument IDN {idn!r} does not contain expected "
-                    f"identity part {part!r} for station {self.station_id!r}"
-                )
+        if auto_remote:
+            self.remote_on(verify=verify_remote)
+        return self.idn
 
     def _write_once(self, command: str) -> None:
         ser = self._require_open()
@@ -586,41 +495,34 @@ class EaPs9000T:
         ser.write(payload)
         ser.flush()
 
-    def send(self, txt: str, *, retry: bool = True, check_after: bool = False) -> None:
+    def send(self, txt: str) -> None:
         """
         Send one SCPI command.
 
-        Successful writes return immediately. Set retry=False for non-idempotent
-        commands such as *RST, trigger, sequence-start, memory recall, etc.
-        Set check_after=True for critical commands where the SCPI error queue
-        should be checked immediately after the write.
+        Unlike the prototype, a successful write returns immediately; the command
+        is not sent retry_cnt times.
         """
         last_exc: Optional[BaseException] = None
         command = str(txt).strip()
         if not command:
             raise ValueError("Cannot send an empty SCPI command")
 
-        max_attempts = self._retry_cnt if retry else 1
-        with self._io_lock:
-            for attempt in range(1, max_attempts + 1):
-                try:
-                    self._write_once(command)
-                    self.logger.debug("[%s] SCPI write: %s", self.station_id, command)
-                    if check_after:
-                        self.check_errors()
-                    return
-                except (SerialException, OSError, CommunicationError) as exc:
-                    last_exc = exc
-                    self.logger.warning(
-                        "[%s] SCPI write failed on attempt %d/%d: %s",
-                        self.station_id,
-                        attempt,
-                        max_attempts,
-                        command,
-                        exc_info=True,
-                    )
-                    if attempt < max_attempts:
-                        time.sleep(self.retry_delay)
+        for attempt in range(1, self._retry_cnt + 1):
+            try:
+                self._write_once(command)
+                self.logger.debug("SCPI write: %s", command)
+                return
+            except (SerialException, OSError, CommunicationError) as exc:
+                last_exc = exc
+                self.logger.warning(
+                    "SCPI write failed on attempt %d/%d: %s",
+                    attempt,
+                    self._retry_cnt,
+                    command,
+                    exc_info=True,
+                )
+                if attempt < self._retry_cnt:
+                    time.sleep(self.retry_delay)
 
         raise CommunicationError(f"Failed to send SCPI command {command!r}") from last_exc
 
@@ -629,55 +531,46 @@ class EaPs9000T:
         Send one SCPI query and return a stripped text response.
 
         The old method name and misspelled parameter name are kept for backward
-        compatibility with existing code. The complete write/read exchange is
-        protected by a lock to prevent watchdog and worker threads from mixing
-        serial replies.
+        compatibility with existing code.
         """
         last_exc: Optional[BaseException] = None
         command = str(cmd_srt).strip()
         if not command:
             raise ValueError("Cannot query an empty SCPI command")
 
-        with self._io_lock:
-            for attempt in range(1, self._retry_cnt + 1):
+        for attempt in range(1, self._retry_cnt + 1):
+            try:
+                ser = self._require_open()
+
+                # FIX-5: On retry attempts, flush both directions so stale bytes
+                # from the failed attempt do not poison the next exchange.
                 try:
-                    ser = self._require_open()
+                    ser.reset_input_buffer()
+                    if attempt > 1:
+                        ser.reset_output_buffer()  # FIX-5: new on retries
+                except (SerialException, OSError):
+                    # Some Serial-like test doubles may not support these.
+                    pass
 
-                    try:
-                        if getattr(ser, "in_waiting", 0):
-                            self.logger.warning(
-                                "[%s] Discarding %s stale input byte(s) before query %s",
-                                self.station_id,
-                                ser.in_waiting,
-                                command,
-                            )
-                        ser.reset_input_buffer()
-                        if attempt > 1:
-                            ser.reset_output_buffer()
-                    except (SerialException, OSError, AttributeError):
-                        # Some Serial-like test doubles may not support these.
-                        pass
+                self._write_once(command)
+                raw = ser.readline()
+                if not raw:
+                    raise CommandTimeoutError(f"No reply to query {command!r}")
 
-                    self._write_once(command)
-                    raw = ser.readline()
-                    if not raw:
-                        raise CommandTimeoutError(f"No reply to query {command!r}")
-
-                    response = raw.decode("ascii", errors="replace").strip()
-                    self.logger.debug("[%s] SCPI query: %s -> %s", self.station_id, command, response)
-                    return response
-                except (SerialException, OSError, UnicodeDecodeError, CommunicationError) as exc:
-                    last_exc = exc
-                    self.logger.warning(
-                        "[%s] SCPI query failed on attempt %d/%d: %s",
-                        self.station_id,
-                        attempt,
-                        self._retry_cnt,
-                        command,
-                        exc_info=True,
-                    )
-                    if attempt < self._retry_cnt:
-                        time.sleep(self.retry_delay)
+                response = raw.decode("ascii", errors="replace").strip()
+                self.logger.debug("SCPI query: %s -> %s", command, response)
+                return response
+            except (SerialException, OSError, UnicodeDecodeError, CommunicationError) as exc:
+                last_exc = exc
+                self.logger.warning(
+                    "SCPI query failed on attempt %d/%d: %s",
+                    attempt,
+                    self._retry_cnt,
+                    command,
+                    exc_info=True,
+                )
+                if attempt < self._retry_cnt:
+                    time.sleep(self.retry_delay)
 
         raise CommunicationError(f"Failed to query SCPI command {command!r}") from last_exc
 
@@ -686,72 +579,60 @@ class EaPs9000T:
         output_off: Optional[bool] = None,
         remote_off: bool = True,
         suppress_errors: bool = True,
-        verify_output_off: Optional[bool] = None,
     ) -> None:
         """
         Close the driver safely.
 
         By default, this turns output off and releases remote mode before closing.
-        In strict/production use, failed output-off is treated as a safety error
-        and the serial port is intentionally left open so a supervisor can try
-        recovery instead of silently losing control of an energized PSU.
+        Pass output_off=False only when another controller intentionally continues
+        controlling the supply.
+
+        After close() returns, calling any instrument method raises
+        DriverClosedError. Call connect() or use the object as a context manager
+        to reopen the connection.
         """
         if output_off is None:
             output_off = self.output_off_on_close
-        if verify_output_off is None:
-            verify_output_off = self.verify_output_off_on_close
 
-        strict = (not suppress_errors) or self.raise_on_close_error or self.production_mode
+        # FIX-1: Set closed flag before touching the port so that any re-entrant
+        # call (e.g. from a signal handler) sees a consistent state.
+        self._closed = True
+
+        if self.ser is None:
+            # FIX-1: Do NOT null out self._cmd; the command builder is stateless
+            # and should remain available for inspection/debugging after close.
+            return
+
         errors: list[BaseException] = []
-
-        with self._io_lock:
-            if self.ser is None:
-                self._closed = True
-                return
-
-            if self.ser.is_open:
-                if self.safe_close and output_off:
-                    try:
-                        # Use the normal method while the driver is still open so
-                        # verification and logging behave consistently.
-                        self.output_off(verify=bool(verify_output_off))
-                        self.output_state_unknown = False
-                    except BaseException as exc:
-                        self.output_state_unknown = True
-                        errors.append(exc)
-                        self.logger.error(
-                            "[%s] SAFETY: could not switch output off during close; "
-                            "serial port remains open in strict mode",
-                            self.station_id,
-                            exc_info=True,
-                        )
-                        if strict:
-                            raise SafetyStateError(
-                                "Could not verify output OFF during close; output state is unknown. "
-                                "Port left open for recovery."
-                            ) from exc
-
-                if remote_off:
-                    try:
-                        self.remote_off()
-                    except BaseException as exc:
-                        errors.append(exc)
-                        self.logger.warning(
-                            "[%s] Could not release remote mode during close",
-                            self.station_id,
-                            exc_info=True,
-                        )
-
+        if self.ser.is_open:
+            if self.safe_close and output_off:
                 try:
-                    self.ser.close()
+                    # Bypass the cmd property guard: we are inside close() and
+                    # _closed is already True, so self.cmd would raise.
+                    self.ser.write(b"OUTP OFF\r\n")
+                    self.ser.flush()
                 except BaseException as exc:
                     errors.append(exc)
-                    self.logger.warning("[%s] Could not close serial port", self.station_id, exc_info=True)
+                    self.logger.warning("Could not switch output off during close", exc_info=True)
+            if remote_off:
+                try:
+                    self.ser.write(b"SYST:LOCK OFF\r\n")
+                    self.ser.flush()
+                except BaseException as exc:
+                    errors.append(exc)
+                    self.logger.warning("Could not release remote mode during close", exc_info=True)
+            try:
+                self.ser.close()
+            except BaseException as exc:
+                errors.append(exc)
+                self.logger.warning("Could not close serial port", exc_info=True)
 
-            self.ser = None
-            self._closed = True
+        self.ser = None
+        # FIX-1: self._cmd is intentionally NOT set to None here. The command
+        # builder is pure Python with no hardware state and can still be
+        # inspected post-close (e.g., to log the last commanded values).
 
-        if errors and strict:
+        if errors and not suppress_errors:
             raise CommunicationError(f"Errors occurred during close: {errors!r}")
 
     # ------------------------------------------------------------------
@@ -790,50 +671,46 @@ class EaPs9000T:
 
     def set_voltage(self, val: Number) -> None:
         value = validate_range(val, self.limits.voltage_min, self.limits.voltage_max, "voltage")
-        self.send(self.cmd.source.voltage.val(value), check_after=self.production_mode)
+        self.send(self.cmd.source.voltage.val(value))
 
     def get_voltage_setpoint(self) -> float:
         return parse_numeric_response(self.query(self.cmd.source.voltage.req()))
 
     def set_current(self, val: Number) -> None:
         value = validate_range(val, self.limits.current_min, self.limits.current_max, "current")
-        self.send(self.cmd.source.current.val(value), check_after=self.production_mode)
+        self.send(self.cmd.source.current.val(value))
 
     def get_current_setpoint(self) -> float:
         return parse_numeric_response(self.query(self.cmd.source.current.req()))
 
     def set_power(self, val: Number) -> None:
         value = validate_range(val, self.limits.power_min, self.limits.power_max, "power")
-        self.send(self.cmd.source.power.val(value), check_after=self.production_mode)
+        self.send(self.cmd.source.power.val(value))
 
     def get_power_setpoint(self) -> float:
         return parse_numeric_response(self.query(self.cmd.source.power.req()))
 
     def output_on(self, verify: bool = False) -> None:
-        self.send(self.cmd.output.on(), check_after=self.production_mode)
-        self.output_state_unknown = True
-        if verify or self.production_mode:
-            # Wait for relay actuation before reading back state.
+        self.send(self.cmd.output.on())
+        if verify:
+            # FIX-2: Wait for relay actuation before reading back state.
             time.sleep(OUTPUT_VERIFY_SETTLE_S)
             if not self.is_output_on():
                 raise InstrumentCommandError(
                     "OUTP ON was sent, but output state did not become ON "
                     f"(settle delay={OUTPUT_VERIFY_SETTLE_S * 1000:.0f} ms)"
                 )
-            self.output_state_unknown = False
 
     def output_off(self, verify: bool = False) -> None:
-        self.send(self.cmd.output.off(), check_after=self.production_mode)
-        self.output_state_unknown = True
-        if verify or self.production_mode:
-            # Wait for relay actuation before reading back state.
+        self.send(self.cmd.output.off())
+        if verify:
+            # FIX-2: Wait for relay actuation before reading back state.
             time.sleep(OUTPUT_VERIFY_SETTLE_S)
             if self.is_output_on():
                 raise InstrumentCommandError(
                     "OUTP OFF was sent, but output state is still ON "
                     f"(settle delay={OUTPUT_VERIFY_SETTLE_S * 1000:.0f} ms)"
                 )
-            self.output_state_unknown = False
 
     def is_output_on(self) -> bool:
         reply = self.query(self.cmd.output.req())
@@ -882,12 +759,10 @@ class EaPs9000T:
             raise InstrumentCommandError(f"SCPI error (code {code}): {errors}")
 
     def clear_status(self) -> None:
-        self.send(self.cmd.cls.str(), retry=True)
+        self.send(self.cmd.cls.str())
 
     def reset(self) -> None:
-        # *RST can be non-idempotent from the application point of view; do not
-        # retry blindly after a partial write/timeout.
-        self.send(self.cmd.reset.str(), retry=False)
+        self.send(self.cmd.reset.str())
 
     def read_status_byte(self) -> int:
         reply = self.query(self.cmd.read_status.req())
@@ -895,11 +770,11 @@ class EaPs9000T:
 
     def set_ovp(self, val: Number) -> None:
         value = validate_range(val, self.limits.ovp_min, self.limits.ovp_max, "OVP")
-        self.send(self.cmd.source.voltage.ovp.val(value), check_after=self.production_mode)
+        self.send(self.cmd.source.voltage.ovp.val(value))
 
     def set_ocp(self, val: Number) -> None:
         value = validate_range(val, self.limits.ocp_min, self.limits.ocp_max, "OCP")
-        self.send(self.cmd.source.current.ocp.val(value), check_after=self.production_mode)
+        self.send(self.cmd.source.current.ocp.val(value))
 
     def set_ovc(self, val: Number) -> None:
         """Deprecated compatibility alias for set_ocp()."""
@@ -908,7 +783,7 @@ class EaPs9000T:
 
     def set_opp(self, val: Number) -> None:
         value = validate_range(val, self.limits.opp_min, self.limits.opp_max, "OPP")
-        self.send(self.cmd.source.power.opp.val(value), check_after=self.production_mode)
+        self.send(self.cmd.source.power.opp.val(value))
 
     # ------------------------------------------------------------------
     # Measurement helpers
@@ -927,10 +802,9 @@ class EaPs9000T:
         """
         Return measured voltage, current, and power via three sequential queries.
 
-        Worst-case blocking time is approximately
-        3 × retry_cnt × timeout + retry delays because each quantity is queried
-        separately. If your firmware supports MEAS:ARR?, set
-        measurement_array_supported=True and use measure_all_fast().
+        FIX-8: Worst-case blocking time is 3 × timeout seconds (one readline()
+        call per quantity). If your firmware supports MEAS:ARR?, use
+        measure_all_fast() instead for a single-round-trip measurement.
         """
         return {
             "voltage_v": self.measure_voltage(),
@@ -938,21 +812,17 @@ class EaPs9000T:
             "power_w": self.measure_power(),
         }
 
-    def measure_all_fast(self, *, allow_fallback: bool = True, clear_errors_on_fallback: bool = True) -> dict[str, float]:
+    def measure_all_fast(self) -> dict[str, float]:
         """
-        Single-query measurement using MEAS:ARR? when explicitly enabled.
+        FIX-8: Single-query measurement using MEAS:ARR? (one serial round trip).
 
-        To avoid leaving unsupported-command errors in the SCPI queue, this
-        method does not try MEAS:ARR? unless measurement_array_supported=True
-        was passed to the constructor. If parsing/communication fails and
-        allow_fallback=True, it optionally clears status before falling back to
-        the three-query measure_all() path.
+        Returns the same dict as measure_all(). Raises ValueError if the
+        firmware response cannot be parsed as three comma-separated numbers.
+        Falls back automatically to measure_all() on parse failure so it is
+        safe to call on firmware that does not support MEAS:ARR?.
         """
-        if not self.measurement_array_supported:
-            return self.measure_all()
-
         try:
-            raw = self.query(self.cmd.measure.array.req())
+            raw = self.query("MEAS:ARR?")
             values = parse_csv_numeric_response(raw)
             if len(values) < 3:
                 raise ValueError(f"Expected ≥3 values from MEAS:ARR?, got {len(values)}: {raw!r}")
@@ -962,159 +832,10 @@ class EaPs9000T:
                 "power_w": values[2],
             }
         except (ValueError, CommunicationError) as exc:
-            if not allow_fallback:
-                raise
             self.logger.warning(
-                "[%s] measure_all_fast failed (%s); falling back to measure_all()",
-                self.station_id,
-                exc,
+                "measure_all_fast: MEAS:ARR? failed (%s); falling back to measure_all()", exc
             )
-            if clear_errors_on_fallback:
-                try:
-                    self.clear_status()
-                except EAPSError:
-                    self.logger.warning("[%s] Could not clear status before fallback", self.station_id, exc_info=True)
             return self.measure_all()
-
-    # ------------------------------------------------------------------
-    # Production safety helpers
-    # ------------------------------------------------------------------
-
-    def verify_setpoints(
-        self,
-        voltage: Optional[Number] = None,
-        current: Optional[Number] = None,
-        power: Optional[Number] = None,
-        *,
-        tolerance: float = 1e-6,
-    ) -> None:
-        """Verify programmed setpoints by reading them back from the PSU."""
-        tol = float(tolerance)
-        if voltage is not None:
-            actual = self.get_voltage_setpoint()
-            expected = float(voltage)
-            if abs(actual - expected) > tol:
-                raise InstrumentCommandError(f"Voltage setpoint mismatch: expected {expected:g}, got {actual:g}")
-        if current is not None:
-            actual = self.get_current_setpoint()
-            expected = float(current)
-            if abs(actual - expected) > tol:
-                raise InstrumentCommandError(f"Current setpoint mismatch: expected {expected:g}, got {actual:g}")
-        if power is not None:
-            actual = self.get_power_setpoint()
-            expected = float(power)
-            if abs(actual - expected) > tol:
-                raise InstrumentCommandError(f"Power setpoint mismatch: expected {expected:g}, got {actual:g}")
-
-    def check_device_health(
-        self,
-        *,
-        expected_output: Optional[bool] = None,
-        require_remote: bool = False,
-    ) -> dict[str, Union[int, bool, str, None]]:
-        """
-        Perform generic health checks that are safe across SCPI firmware versions.
-
-        This checks the SCPI error queue, status byte, optional remote-lock owner,
-        and optional output state. Exact EA alarm-bit decoding should be added
-        here if your plant standard defines the model/firmware-specific status
-        register map.
-        """
-        self.check_errors()
-        status_byte = self.read_status_byte()
-        owner: Optional[str] = None
-        output_state: Optional[bool] = None
-
-        if require_remote:
-            owner = self.get_remote_owner()
-            if owner and "REMOTE" not in owner.upper():
-                raise RemoteControlError(f"Remote lock not active. Owner response: {owner!r}")
-
-        if expected_output is not None:
-            output_state = self.is_output_on()
-            if output_state != expected_output:
-                raise InstrumentAlarmError(
-                    f"Unexpected output state: expected {expected_output}, got {output_state}"
-                )
-
-        return {
-            "status_byte": status_byte,
-            "remote_owner": owner,
-            "output_on": output_state,
-            "output_state_unknown": self.output_state_unknown,
-        }
-
-    def check_alarms(self) -> None:
-        """Compatibility health-check hook for plant code."""
-        self.check_device_health()
-
-    def enable_output_safely(
-        self,
-        *,
-        voltage: Number,
-        current: Number,
-        ovp: Number,
-        ocp: Number,
-        opp: Optional[Number] = None,
-        power: Optional[Number] = None,
-        verify: bool = True,
-        tolerance: float = 1e-6,
-    ) -> None:
-        """
-        One-shot safe output-enable sequence for plant automation.
-
-        The order is deliberate: obtain remote lock, clear stale status, program
-        protection limits first, then setpoints, verify, and only then energize
-        the output.
-        """
-        with self._io_lock:
-            self.remote_on(verify=True)
-            self.clear_status()
-            self.set_ovp(ovp)
-            self.set_ocp(ocp)
-            if opp is not None:
-                self.set_opp(opp)
-            if power is not None:
-                self.set_power(power)
-            self.set_voltage(voltage)
-            self.set_current(current)
-
-            if verify:
-                self.verify_setpoints(voltage=voltage, current=current, power=power, tolerance=tolerance)
-                self.check_device_health(require_remote=True)
-
-            self.output_on(verify=True)
-
-            if verify:
-                self.check_device_health(expected_output=True, require_remote=True)
-
-    def reconnect_safely(self, *, force_output_off: bool = True, verify_output_off: bool = False) -> str:
-        """
-        Best-effort reconnect helper for supervisors after link loss or USB reset.
-
-        If communication is still possible and force_output_off=True, the driver
-        tries to de-energize the output before closing/reopening. If output state
-        cannot be verified, output_state_unknown is set and the caller should
-        escalate according to plant safety rules.
-        """
-        with self._io_lock:
-            try:
-                if self.is_connected:
-                    self.close(
-                        output_off=force_output_off,
-                        remote_off=True,
-                        suppress_errors=not self.production_mode,
-                        verify_output_off=verify_output_off,
-                    )
-            except SafetyStateError:
-                self.output_state_unknown = True
-                raise
-            except EAPSError:
-                self.logger.warning("[%s] Error during reconnect close phase", self.station_id, exc_info=True)
-
-            self._closed = False
-            self.ser = None
-            return self.connect(auto_remote=True, verify_remote=self.production_mode)
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,1 @@
+timestamp_iso,elapsed_s,step_index,set_voltage_v,set_current_a,set_power_w,measured_voltage_v,measured_current_a,measured_power_w,output_state,status,message
