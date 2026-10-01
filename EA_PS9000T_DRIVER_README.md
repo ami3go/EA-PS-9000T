@@ -22,10 +22,16 @@ EA_PS9000T_DRIVER_README.md        # This document
 
 ## Installation
 
-The driver uses `pyserial`. `pyvisa` is not required.
+The driver still speaks plain serial SCPI — `pyvisa` is not required. The
+transport, SCPI framing, and generic numeric/CSV parsing are implemented on
+top of [`scpi-driver-core`](https://github.com/ami3go/scpi-driver-core)'s
+`SerialTransport`/`ScpiClient` (installed automatically as a dependency,
+pulling in `pyserial` transitively); everything above that layer — command
+set, retry/reconnect behavior, safety limits — is unchanged. Requires Python
+3.10+.
 
 ```bash
-pip install pyserial
+pip install eaps9000t
 ```
 
 Optional tools for development/testing:

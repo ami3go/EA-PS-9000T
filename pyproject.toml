@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "eaps9000t"
-version = "0.1.4"
+version = "0.2.0"
 description = "Serial SCPI control helpers for EA Elektro-Automatik PS 9000 T power supplies."
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = { file = "LICENSE" }
 authors = [{ name = "Aleksandr Chasnyk" }]
 keywords = ["EA", "Elektro-Automatik", "PS 9000 T", "SCPI", "power-supply", "serial"]
@@ -18,13 +18,15 @@ classifiers = [
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering",
 ]
-dependencies = ["pyserial>=3.5"]
+dependencies = [
+    "pyserial>=3.5",
+    "scpi-driver-core[serial] @ git+https://github.com/ami3go/scpi-driver-core@56a8940f31c84255a9c28c2a1a5c7b4480b5ae7f",
+]
 
 [project.optional-dependencies]
 dev = ["build>=1.2", "pytest>=7"]

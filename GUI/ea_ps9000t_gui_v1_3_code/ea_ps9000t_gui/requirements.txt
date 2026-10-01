@@ -2,3 +2,6 @@ PySide6>=6.6
 pyserial>=3.5
 matplotlib>=3.8
 pytest>=8.0
+# The EAPS9000T driver package (repo root), installed editable so the GUI
+# picks up driver changes without a separate release step.
+-e ../../..

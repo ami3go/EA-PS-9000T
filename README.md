@@ -20,7 +20,16 @@ cd EA-PS-9000T
 python -m pip install .
 ```
 
-The package installs [pyserial](https://pyserial.readthedocs.io/) automatically. Python 3.9 or newer is required.
+The package installs [pyserial](https://pyserial.readthedocs.io/) and
+[scpi-driver-core](https://github.com/ami3go/scpi-driver-core) (the shared
+SCPI transport/framing/parsing layer used internally) automatically. Python
+3.10 or newer is required.
+
+`scpi-driver-core` isn't published to PyPI yet, so it's pinned to a specific
+commit via a `git+https://` dependency. This means `eaps9000t` itself can't
+currently be re-published to PyPI until that dependency is available there
+too (PyPI rejects package uploads with direct URL dependencies) — installing
+from GitHub, as above, is the supported path for now.
 
 ## Quick start
 

@@ -5,7 +5,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Optional
 
-from EAPS9000T_class import EaPs9000T, PowerSupplyLimits, list_serial_ports
+from EAPS9000T import EaPs9000T, PowerSupplyLimits, list_serial_ports
 
 from .exceptions import NotConnectedError
 from .mock_psu import MockFaultConfig, MockPsu

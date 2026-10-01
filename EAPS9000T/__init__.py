@@ -4,6 +4,7 @@ from .EAPS9000T_class import (
     EaPs9000T,
     PowerSupplyLimits,
     get_com_port_by_keyword,
+    list_serial_ports,
     storage,
 )
 
@@ -15,5 +16,6 @@ __all__ = [
     "PowerSupplyLimit",
     "PowerSupplyLimits",
     "get_com_port_by_keyword",
+    "list_serial_ports",
     "storage",
 ]

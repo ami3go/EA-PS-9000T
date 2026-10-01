@@ -5,7 +5,7 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
-from EAPS9000T_class import (
+from EAPS9000T.EAPS9000T_class import (
     CommunicationError,
     DeviceIdentityError,
     InstrumentCommandError,

@@ -83,6 +83,30 @@ else:
     SerialException = serial.SerialException
     _PY_SERIAL_IMPORT_ERROR = None
 
+# Transport/framing/parsing infrastructure shared with other SCPI drivers.
+# scpi-driver-core is a hard dependency (unlike the pyserial guard above),
+# so these imports are not similarly guarded.
+from scpi_driver_core import exceptions as _core_exc
+from scpi_driver_core.scpi import (
+    ScpiClient,
+    ScpiTextCodec,
+    parse_csv as _parse_csv,
+    parse_int as _parse_int,
+    parse_optional_unit_float as _parse_optional_unit_float,
+)
+from scpi_driver_core.transport import FlushDirection, SerialTransport
+
+# Matches the wire format this driver has always used: commands terminated
+# with CRLF, replies terminated with LF (readline()-equivalent). Tolerant
+# ("replace") decoding mirrors the previous raw.decode("ascii", errors="replace").
+_CODEC = ScpiTextCodec(
+    encoding="ascii",
+    command_terminator=b"\r\n",
+    response_terminator=b"\n",
+    decode_errors="replace",
+    maximum_response_size=4096,
+)
+
 Number = Union[int, float]
 
 # How long to wait after sending OUTP ON/OFF before reading back state.
@@ -279,16 +303,28 @@ def parse_numeric_response(response: str) -> float:
     Examples:
         '12.34V' -> 12.34
         '1.2E-3 A' -> 0.0012
+
+    Uses scpi_driver_core's stricter, unit-aware parser for the common case
+    (a bare number or "number unit" and nothing else), falling back to a
+    lenient substring search for any response that doesn't fit that shape —
+    preserving this function's historic leniency.
     """
-    match = re.search(r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?", response.strip())
-    if not match:
-        raise ValueError(f"No numeric value found in response {response!r}")
-    return float(match.group(0))
+    try:
+        return _parse_optional_unit_float(response, allow_non_finite=True)
+    except _core_exc.ResponseParseError:
+        match = re.search(r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?", response.strip())
+        if not match:
+            raise ValueError(f"No numeric value found in response {response!r}")
+        return float(match.group(0))
 
 
 def parse_csv_numeric_response(response: str) -> tuple[float, ...]:
     """Parse comma-separated numeric response values that may include units."""
-    return tuple(parse_numeric_response(item) for item in response.split(",") if item.strip())
+    try:
+        items = _parse_csv(response)
+    except _core_exc.ResponseParseError:
+        items = response.split(",")
+    return tuple(parse_numeric_response(item) for item in items if item.strip())
 
 
 def _contains_case_insensitive(haystack: str, needle: str) -> bool:
@@ -389,7 +425,8 @@ class EaPs9000T:
 
         self._cmd = storage(limits=limits)   # FIX-1: private; never set to None
         self._io_lock = threading.RLock()    # plant-safe serialization of all serial I/O
-        self.ser: Optional[serial.Serial] = None
+        self._transport: Optional[SerialTransport] = None
+        self._client: Optional[ScpiClient] = None
         self.port = port
         self.baudrate = int(baudrate)
         self.timeout = float(timeout)
@@ -447,7 +484,7 @@ class EaPs9000T:
 
     @property
     def is_connected(self) -> bool:
-        return self.ser is not None and bool(self.ser.is_open)
+        return self._transport is not None and self._transport.is_open
 
     # ------------------------------------------------------------------
     # Context manager
@@ -488,13 +525,13 @@ class EaPs9000T:
                 "Construct a new instance or call connect() to reopen."
             )
 
-    def _require_open(self) -> "serial.Serial":
+    def _require_open(self) -> SerialTransport:
         self._require_cmd()  # FIX-1: check closed state first
-        if self.ser is None:
-            raise CommunicationError("Serial port is not open: self.ser is None")
-        if not self.ser.is_open:
+        if self._transport is None:
+            raise CommunicationError("Serial transport is not open: self._transport is None")
+        if not self._transport.is_open:
             raise CommunicationError(f"Serial port {self.port!r} is closed")
-        return self.ser
+        return self._transport
 
     # ------------------------------------------------------------------
     # Connection management
@@ -530,19 +567,26 @@ class EaPs9000T:
 
             self.port = selected_port
             _require_pyserial()
+            transport = SerialTransport(
+                port=selected_port,
+                baudrate=self.baudrate,
+                timeout_s=self.timeout,
+                write_timeout_s=self.write_timeout,
+                bytesize=8,
+                parity="N",
+                stopbits=1,
+            )
             try:
-                self.ser = serial.Serial(
-                    port=selected_port,
-                    baudrate=self.baudrate,
-                    timeout=self.timeout,
-                    write_timeout=self.write_timeout,
-                )
-            except SerialException as exc:
+                transport.open()
+            except _core_exc.TransportError as exc:
                 raise CommunicationError(f"Could not open serial port {selected_port!r}") from exc
 
+            self._transport = transport
+            self._client = ScpiClient(transport, codec=_CODEC)
+
             try:
-                self.ser.reset_input_buffer()
-            except (SerialException, OSError):
+                transport.flush(FlushDirection.INPUT)
+            except _core_exc.TransportError:
                 pass
 
             try:
@@ -561,10 +605,11 @@ class EaPs9000T:
             except BaseException:
                 # Avoid leaving an open handle after a failed identity/remote check.
                 try:
-                    if self.ser is not None and self.ser.is_open:
-                        self.ser.close()
+                    if self._transport is not None and self._transport.is_open:
+                        self._transport.close()
                 finally:
-                    self.ser = None
+                    self._transport = None
+                    self._client = None
                     self._closed = True
                 raise
 
@@ -584,10 +629,13 @@ class EaPs9000T:
                 )
 
     def _write_once(self, command: str) -> None:
-        ser = self._require_open()
-        payload = f"{command}\r\n".encode("ascii")
-        ser.write(payload)
-        ser.flush()
+        self._require_open()
+        try:
+            self._client.write(command)
+        except _core_exc.NotConnectedError as exc:
+            raise CommunicationError(f"Serial port {self.port!r} is not open") from exc
+        except _core_exc.TransportError as exc:
+            raise CommunicationError(f"Failed to write SCPI command {command!r}: {exc}") from exc
 
     def send(self, txt: str, *, retry: bool = True, check_after: bool = False) -> None:
         """
@@ -644,32 +692,34 @@ class EaPs9000T:
         with self._io_lock:
             for attempt in range(1, self._retry_cnt + 1):
                 try:
-                    ser = self._require_open()
+                    self._require_open()
 
                     try:
-                        if getattr(ser, "in_waiting", 0):
-                            self.logger.warning(
-                                "[%s] Discarding %s stale input byte(s) before query %s",
-                                self.station_id,
-                                ser.in_waiting,
-                                command,
-                            )
-                        ser.reset_input_buffer()
+                        self._transport.flush(FlushDirection.INPUT)
                         if attempt > 1:
-                            ser.reset_output_buffer()
-                    except (SerialException, OSError, AttributeError):
-                        # Some Serial-like test doubles may not support these.
+                            self._transport.flush(FlushDirection.OUTPUT)
+                    except _core_exc.TransportError:
+                        # Some transport test doubles may not support flush().
                         pass
 
-                    self._write_once(command)
-                    raw = ser.readline()
-                    if not raw:
+                    try:
+                        response = self._client.query(command)
+                    except _core_exc.NotConnectedError as exc:
+                        raise CommunicationError(f"Serial port {self.port!r} is not open") from exc
+                    except _core_exc.TransportTimeoutError as exc:
+                        raise CommandTimeoutError(f"No reply to query {command!r}") from exc
+                    except (_core_exc.TransportError, _core_exc.ProtocolError) as exc:
+                        raise CommunicationError(
+                            f"Failed to query SCPI command {command!r}: {exc}"
+                        ) from exc
+
+                    response = response.strip()
+                    if not response:
                         raise CommandTimeoutError(f"No reply to query {command!r}")
 
-                    response = raw.decode("ascii", errors="replace").strip()
                     self.logger.debug("[%s] SCPI query: %s -> %s", self.station_id, command, response)
                     return response
-                except (SerialException, OSError, UnicodeDecodeError, CommunicationError) as exc:
+                except CommunicationError as exc:
                     last_exc = exc
                     self.logger.warning(
                         "[%s] SCPI query failed on attempt %d/%d: %s",
@@ -708,11 +758,11 @@ class EaPs9000T:
         errors: list[BaseException] = []
 
         with self._io_lock:
-            if self.ser is None:
+            if self._transport is None:
                 self._closed = True
                 return
 
-            if self.ser.is_open:
+            if self._transport.is_open:
                 if self.safe_close and output_off:
                     try:
                         # Use the normal method while the driver is still open so
@@ -746,12 +796,13 @@ class EaPs9000T:
                         )
 
                 try:
-                    self.ser.close()
+                    self._transport.close()
                 except BaseException as exc:
                     errors.append(exc)
                     self.logger.warning("[%s] Could not close serial port", self.station_id, exc_info=True)
 
-            self.ser = None
+            self._transport = None
+            self._client = None
             self._closed = True
 
         if errors and strict:
@@ -908,10 +959,14 @@ class EaPs9000T:
         errors = self.get_errors()
         try:
             # SCPI error format: <code>,"<message>"[,<code>,"<message>",...]
-            # The first field is the numeric error code.
-            first_field = errors.split(",")[0].strip()
-            code = int(float(first_field))
-        except (ValueError, IndexError):
+            # The first field is the numeric error code. parse_csv respects
+            # quoting so a comma inside a quoted message isn't mistaken for a
+            # field separator.
+            fields = _parse_csv(errors)
+            if not fields:
+                raise ValueError("empty error response")
+            code = _parse_int(fields[0].strip())
+        except (_core_exc.ResponseParseError, ValueError, IndexError):
             # Unparseable response — treat it as an error to be safe.
             self.logger.warning("check_errors: cannot parse SCPI error response %r", errors)
             raise InstrumentCommandError(f"Unparseable error response: {errors!r}")
@@ -1177,7 +1232,8 @@ class EaPs9000T:
                 if attempt > 1:
                     time.sleep(reconnect_delay)
                 self._closed = False
-                self.ser = None
+                self._transport = None
+                self._client = None
                 try:
                     reconnected_idn = self.connect(
                         auto_remote=True,
@@ -1186,13 +1242,14 @@ class EaPs9000T:
                     if previous_idn and reconnected_idn != previous_idn:
                         # Do not continue operating if a port enumeration change
                         # or cable swap connected us to a different instrument.
-                        replacement_ser = self.ser
-                        self.ser = None
+                        replacement_transport = self._transport
+                        self._transport = None
+                        self._client = None
                         self._closed = True
-                        if replacement_ser is not None:
+                        if replacement_transport is not None:
                             try:
-                                replacement_ser.close()
-                            except (SerialException, OSError):
+                                replacement_transport.close()
+                            except _core_exc.TransportError:
                                 pass
                         raise DeviceIdentityError(
                             "Serial reconnection returned a different instrument identity: "

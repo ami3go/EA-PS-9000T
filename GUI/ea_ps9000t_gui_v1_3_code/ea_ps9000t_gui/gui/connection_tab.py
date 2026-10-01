@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.psu_controller import PsuConnectionConfig, PsuController
-from EAPS9000T_class import PowerSupplyLimits
+from EAPS9000T import PowerSupplyLimits
 
 
 class ConnectionTab(QWidget):

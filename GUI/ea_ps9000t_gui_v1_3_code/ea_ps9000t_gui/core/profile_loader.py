@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 try:
-    from EAPS9000T_class import PowerSupplyLimits
+    from EAPS9000T import PowerSupplyLimits
 except Exception:  # pragma: no cover - only for unusual import paths
     PowerSupplyLimits = object  # type: ignore
 

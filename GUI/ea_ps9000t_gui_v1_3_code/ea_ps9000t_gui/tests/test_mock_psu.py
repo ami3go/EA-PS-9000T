@@ -1,6 +1,7 @@
 import pytest
 
-from EAPS9000T_class import PowerSupplyLimits, RangeError
+from EAPS9000T.EAPS9000T_class import RangeError
+from EAPS9000T import PowerSupplyLimits
 from core.mock_psu import MockPsu
 
 

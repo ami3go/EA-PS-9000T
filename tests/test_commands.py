@@ -11,6 +11,7 @@ serial_tools = ModuleType("serial.tools")
 serial_list_ports = ModuleType("serial.tools.list_ports")
 serial_list_ports.comports = lambda: []
 serial.tools = serial_tools
+serial.SerialException = OSError
 serial_tools.list_ports = serial_list_ports
 sys.modules.setdefault("serial", serial)
 sys.modules.setdefault("serial.tools", serial_tools)

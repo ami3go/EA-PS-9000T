@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from EAPS9000T_class import PowerSupplyLimits
+from EAPS9000T import PowerSupplyLimits
 from core.profile_loader import load_voltage_profile
 from core.profile_runner import ProfileRunner, ProfileRunnerConfig
 from core.psu_controller import PsuConnectionConfig, PsuController
